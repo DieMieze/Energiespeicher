@@ -1,0 +1,58 @@
+# Import necessary libraries
+import pandas as pd
+import os
+
+# Define file paths
+data_dir = "data"  # Directory where CSV files are stored
+output_dir = "output"  # Directory where text files will be saved
+
+# Create output directory if it doesn't exist
+os.makedirs(output_dir, exist_ok=True)
+
+# Define file paths for CSV files
+verbrauch_path = os.path.join(data_dir, "Realisierter_Stromverbrauch_202401010000_202501010000_Viertelstunde.csv")
+produktion_path = os.path.join(data_dir, "Realisierte_Erzeugung_202401010000_202501010000_Viertelstunde.csv")
+
+# Read CSV files
+verbrauch = pd.read_csv(verbrauch_path, sep=';', decimal=',', thousands='.', parse_dates=['Datum von', 'Datum bis'], dayfirst=True)
+produktion = pd.read_csv(produktion_path, sep=';', decimal=',', thousands='.', parse_dates=['Datum von', 'Datum bis'], dayfirst=True)
+
+# Cache data into text files
+verbrauch.to_csv(os.path.join(output_dir, "verbrauch_data.txt"), sep='\t', index=False)
+produktion.to_csv(os.path.join(output_dir, "produktion_data.txt"), sep='\t', index=False)
+
+# Normalize data year by year
+verbrauch['Year'] = verbrauch['Datum von'].dt.year
+produktion['Year'] = produktion['Datum von'].dt.year
+
+# Define user-defined variables for normalization
+consumption_column = 'Netzlast [MWh] Originalauflösungen'
+production_columns = [
+    'Biomasse [MWh] Originalauflösungen',
+    'Wasserkraft [MWh] Originalauflösungen',
+    'Wind Offshore [MWh] Originalauflösungen',
+    'Wind Onshore [MWh] Originalauflösungen',
+    'Photovoltaik [MWh] Originalauflösungen',
+    'Sonstige Erneuerbare [MWh] Originalauflösungen'
+]
+
+# Calculate annual totals
+annual_consumption = verbrauch.groupby('Year')[consumption_column].sum()
+annual_production = produktion.groupby('Year')[production_columns].sum().sum(axis=1)
+
+# Calculate surplus and loss
+annual_surplus = annual_production - annual_consumption
+annual_surplus_percentage = (annual_surplus / annual_consumption) * 100
+
+# Calculate average annual surplus and loss
+average_annual_surplus = annual_surplus.mean()
+average_annual_loss = annual_surplus[annual_surplus < 0].mean()
+
+# Display results
+print("Average Annual Surplus (% of Annual Consumption):", average_annual_surplus)
+print("Average Annual Loss (MWh):", average_annual_loss)
+
+# Save results to text files
+with open(os.path.join(output_dir, "annual_summary.txt"), "w") as f:
+    f.write("Average Annual Surplus (% of Annual Consumption): {:.2f}\n".format(average_annual_surplus))
+    f.write("Average Annual Loss (MWh): {:.2f}\n".format(average_annual_loss))
