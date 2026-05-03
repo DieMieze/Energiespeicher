@@ -1,3 +1,4 @@
+import argparse
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -14,11 +15,11 @@ OUTPUT_DIR = BASE / "data" / "simulated"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Benutzerdefinierte Variablen ---
-FAKTOR = 1.0  # Faktor für Produktionsnormalisierung (1000 TWh * FAKTOR)
-ALPHA = 0.5  # Verhältnis Sonne zu Wind (z.B. 0.5 bedeutet 50% Sonne, 50% Wind)
-SPEICHER_KAPAZITAET_TWH = 10000.0  # Speicherkapazität in TWh
-EINSPEISE_EFFIZIENZ = 1  # Effizienz beim Einspeisen (90%)
-AUSSPEISE_EFFIZIENZ = 1  # Effizienz beim Ausspeisen (90%)
+# FAKTOR = 1.0  # Faktor für Produktionsnormalisierung (1000 TWh * FAKTOR)
+# ALPHA = 0.5  # Verhältnis Sonne zu Wind (z.B. 0.5 bedeutet 50% Sonne, 50% Wind)
+# SPEICHER_KAPAZITAET_TWH = 10000.0  # Speicherkapazität in TWh
+# EINSPEISE_EFFIZIENZ = 1  # Effizienz beim Einspeisen (90%)
+# AUSSPEISE_EFFIZIENZ = 1  # Effizienz beim Ausspeisen (90%)
 
 # --- Spaltennamen ---
 DATE_COL = "Datum von"
@@ -67,45 +68,71 @@ def rescale_to_target(series, target_twh=1000.0):
     return series
 
 def simulate_storage(production_twh, consumption_twh, capacity_twh, eta_in, eta_out):
-    """Simuliert den Speicher mit Produktion und Verbrauch."""
+    """Simuliert den Speicher mit Produktion und Verbrauch.
+    Gibt zurück: storage_levels, deltas, total_stored, total_loss"""
     storage_level = 0.5 * capacity_twh  # Start bei 50% Kapazität
     storage_levels = []
     deltas = []
     total_stored = 0.0
+    total_loss = 0.0
 
     for prod, cons in zip(production_twh, consumption_twh):
         delta = prod - cons
         if delta > 0:
             # Überschuss: Einspeisen
-            to_store = delta * eta_in
-            if storage_level + to_store <= capacity_twh:
-                storage_level += to_store
-                total_stored += to_store
+            energy_to_store = delta  # Energie vor Effizienzberechnung
+            stored_energy = energy_to_store * eta_in  # Energie nach Effizienz
+            loss_on_charging = energy_to_store * (1 - eta_in)  # Verlust beim Laden
+            
+            if storage_level + stored_energy <= capacity_twh:
+                storage_level += stored_energy
+                total_stored += stored_energy
+                total_loss += loss_on_charging
             else:
                 # Speicher voll, überschüssige Energie geht verloren
+                total_loss += (capacity_twh - storage_level) * (1 - eta_in)/eta_in
                 storage_level = capacity_twh
-                total_stored += (capacity_twh - (storage_level - to_store))
+                total_stored += (capacity_twh - storage_level)
         elif delta < 0:
             # Defizit: Ausspeisen
-            needed = -delta / eta_out
-            if storage_level >= needed:
-                storage_level -= needed
+            energy_needed = -delta  # Energie, die gebraucht wird
+            energy_from_storage = energy_needed / eta_out  # Energie aus Speicher (mit Verlust)
+            loss_on_discharging = energy_needed * (1 - eta_out)  # Verlust beim Entladen
+            
+            if storage_level >= energy_from_storage:
+                storage_level -= energy_from_storage
+                total_loss += loss_on_discharging
             else:
                 # Speicher leer, Defizit bleibt
+                total_loss += (energy_from_storage - storage_level) * (1 - eta_out)
                 storage_level = 0.0
         deltas.append(delta)
         storage_levels.append(storage_level)
 
-    return storage_levels, deltas, total_stored
+    return storage_levels, deltas, total_stored, total_loss
 
 def main():
-    print("Lade Verbrauchsdaten...")
+    parser = argparse.ArgumentParser(description='Speichersimulation mit variablen Parametern')
+    parser.add_argument('--alpha', type=float, default=0.5, help='Anteil PV an erneuerbarer Produktion (0..1)')
+    parser.add_argument('--capacity', type=float, default=1000.0, help='Speicherkapazität in TWh')
+    parser.add_argument('--factor', type=float, default=1.0, help='Multiplikator für Produktionsziel (1000 TWh * factor)')
+    parser.add_argument('--eta-in', type=float, default=1, help='Einspeiseeffizienz (0..1)')
+    parser.add_argument('--eta-out', type=float, default=1, help='Ausspeiseeffizienz (0..1)')
+    args = parser.parse_args()
+
+    ALPHA = args.alpha
+    SPEICHER_KAPAZITAET_TWH = args.capacity
+    FAKTOR = args.factor
+    EINSPEISE_EFFIZIENZ = args.eta_in
+    AUSSPEISE_EFFIZIENZ = args.eta_out
+
+    print(f"Lade Verbrauchsdaten...")
     cons_df = load_consumption_data()
     if cons_df.empty:
         print("Keine Verbrauchsdaten gefunden.")
         return
 
-    print("Lade Produktionsdaten...")
+    print(f"Lade Produktionsdaten...")
     prod_df = load_production_data()
     if prod_df.empty:
         print("Keine Produktionsdaten gefunden.")
@@ -168,7 +195,7 @@ def main():
         prod_series = prod_y["Prod_total_norm_TWh"]
         cons_series = cons_y["Cons_norm_TWh"]
 
-        storage_levels, deltas, total_stored = simulate_storage(
+        storage_levels, deltas, total_stored, total_loss = simulate_storage(
             prod_series, cons_series, SPEICHER_KAPAZITAET_TWH, EINSPEISE_EFFIZIENZ, AUSSPEISE_EFFIZIENZ
         )
 
@@ -184,7 +211,16 @@ def main():
         output_file = OUTPUT_DIR / f"simulation_{year}_alpha_{ALPHA}_capacity_{SPEICHER_KAPAZITAET_TWH}.csv"
         results_df.to_csv(output_file, sep=";", decimal=",", index=False)
 
-        print(f"Jahr {year}: Gespeichert {total_stored:.2f} TWh, Ergebnisse in {output_file}")
+        # Statistiken speichern
+        stats_file = OUTPUT_DIR / f"stats_{year}_alpha_{ALPHA}_capacity_{SPEICHER_KAPAZITAET_TWH}.txt"
+        with open(stats_file, 'w') as f:
+            f.write(f"Jahr: {year}\n")
+            f.write(f"Alpha: {ALPHA}\n")
+            f.write(f"Capacity: {SPEICHER_KAPAZITAET_TWH} TWh\n")
+            f.write(f"Stored: {total_stored:.4f} TWh\n")
+            f.write(f"Loss: {total_loss:.4f} TWh\n")
+
+        print(f"Jahr {year}: Gespeichert {total_stored:.4f} TWh, Verlust {total_loss:.4f} TWh")
 
     print("\nSimulation abgeschlossen.")
 
