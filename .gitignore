@@ -10,3 +10,5 @@
 /Realisierter_Stromverbrauch_202506180000_202506290000_Viertelstunde.csv
 **/simulated/**
 .vscode/**
+*.pyc
+__pycache__/**

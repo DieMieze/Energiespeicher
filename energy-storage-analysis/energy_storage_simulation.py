@@ -4,6 +4,8 @@ import numpy as np
 from pathlib import Path
 import sys
 
+from storage_manager import StorageManager
+
 # --- Projektstruktur ---
 try:
     BASE = Path(__file__).resolve().parent
@@ -67,9 +69,70 @@ def rescale_to_target(series, target_twh=1000.0):
         return series * (target_twh / annual_sum)
     return series
 
-def simulate_storage(production_twh, consumption_twh, capacity_twh, eta_in, eta_out):
-    """Simuliert den Speicher mit Produktion und Verbrauch.
-    Gibt zurück: storage_levels, deltas, total_stored, total_loss"""
+
+def prepare_yearly_series(cons_y, prod_y, alpha, factor):
+    cons_y[CONSUMPTION_COL] = parse_german_number_series(cons_y[CONSUMPTION_COL])
+    prod_y[WIND_OFFSHORE_COL] = parse_german_number_series(prod_y.get(WIND_OFFSHORE_COL, pd.Series(dtype='float64')))
+    prod_y[WIND_ONSHORE_COL] = parse_german_number_series(prod_y.get(WIND_ONSHORE_COL, pd.Series(dtype='float64')))
+    prod_y[PV_COL] = parse_german_number_series(prod_y.get(PV_COL, pd.Series(dtype='float64')))
+
+    wind_total = prod_y[WIND_OFFSHORE_COL].fillna(0) + prod_y[WIND_ONSHORE_COL].fillna(0)
+    total_renew = prod_y[PV_COL].sum() / 4.0 + wind_total.sum() / 4.0
+
+    if total_renew > 0:
+        target_prod = 1000.0 * factor
+        prod_y["PV_norm_TWh"] = rescale_to_target(prod_y[PV_COL], target_prod * alpha)
+        prod_y["Wind_norm_TWh"] = rescale_to_target(wind_total, target_prod * (1 - alpha))
+        prod_y["Prod_total_norm_TWh"] = prod_y["PV_norm_TWh"] + prod_y["Wind_norm_TWh"]
+    else:
+        prod_y["PV_norm_TWh"] = 0
+        prod_y["Wind_norm_TWh"] = 0
+        prod_y["Prod_total_norm_TWh"] = 0
+
+    cons_y["Cons_norm_TWh"] = rescale_to_target(cons_y[CONSUMPTION_COL], 1000.0)
+    prod_y = prod_y.sort_values(DATE_COL)
+    cons_y = cons_y.sort_values(DATE_COL)
+    return prod_y["Prod_total_norm_TWh"], cons_y["Cons_norm_TWh"], prod_y, cons_y
+
+
+def build_storage_manager(storage_defs, initial_level_percents=None):
+    manager = StorageManager()
+    for name, capacity, eta_in, eta_out in storage_defs:
+        initial_level_percent = None
+        if initial_level_percents and name in initial_level_percents:
+            initial_level_percent = initial_level_percents[name]
+        manager.add_speicher(name, capacity, eta_in, eta_out, initial_level_percent)
+    return manager
+
+
+def run_storage_simulation(production_twh, consumption_twh, storage_manager):
+    rows = []
+    for prod, cons in zip(production_twh, consumption_twh):
+        delta = prod - cons
+        delta_r_final, step_results = storage_manager.timestep(delta)
+        row = {
+            "Delta_TWh": delta,
+            "Delta_r_final_TWh": delta_r_final,
+        }
+
+        for storage_result in step_results:
+            name = storage_result["name"]
+            row[f"Delta_r_{name}_TWh"] = storage_result["delta_r"]
+            row[f"Storage_Level_{name}_TWh"] = storage_result["storage_level"]
+            row[f"Storage_Level_{name}_Pct"] = storage_result["storage_level_percent"]
+            row[f"Loss_{name}_TWh"] = storage_result["step_loss"]
+            row[f"Power_Flow_{name}_TWh"] = storage_result["f_tilde"]
+            row[f"Charge_{name}_TWh"] = storage_result["charge_twh"]
+            row[f"Discharge_{name}_TWh"] = storage_result["discharge_twh"]
+
+        rows.append(row)
+
+    return storage_manager, rows
+
+
+""" def simulate_storage(production_twh, consumption_twh, capacity_twh, eta_in, eta_out):
+    # Simuliert den Speicher mit Produktion und Verbrauch.
+    # Gibt zurück: storage_levels, deltas, total_stored, total_loss
     storage_level = 0.5 * capacity_twh  # Start bei 50% Kapazität
     storage_levels = []
     deltas = []
@@ -109,7 +172,7 @@ def simulate_storage(production_twh, consumption_twh, capacity_twh, eta_in, eta_
         deltas.append(delta)
         storage_levels.append(storage_level)
 
-    return storage_levels, deltas, total_stored, total_loss
+    return storage_levels, deltas, total_stored, total_loss """
 
 def main():
     parser = argparse.ArgumentParser(description='Speichersimulation mit variablen Parametern')
@@ -141,6 +204,9 @@ def main():
     # Verfügbare Jahre
     years = sorted(cons_df["Jahr"].dropna().unique())
     print(f"Verfügbare Jahre: {years}")
+    end_levels_by_storage = {}
+    capacities_by_storage = {}
+    yearly_data = []
 
     for year in years:
         print(f"\n--- Verarbeite Jahr {year} ---")
@@ -153,74 +219,57 @@ def main():
             print(f"Keine Daten für Jahr {year}.")
             continue
 
-        # Parse Zahlen
-        cons_y[CONSUMPTION_COL] = parse_german_number_series(cons_y[CONSUMPTION_COL])
-        prod_y[WIND_OFFSHORE_COL] = parse_german_number_series(prod_y.get(WIND_OFFSHORE_COL, pd.Series()))
-        prod_y[WIND_ONSHORE_COL] = parse_german_number_series(prod_y.get(WIND_ONSHORE_COL, pd.Series()))
-        prod_y[PV_COL] = parse_german_number_series(prod_y.get(PV_COL, pd.Series()))
-
-        # Kombiniere Wind
-        wind_total = prod_y[WIND_OFFSHORE_COL].fillna(0) + prod_y[WIND_ONSHORE_COL].fillna(0)
-
-        # Normiere Produktion: Nur Wind und Sonne, Verhältnis alpha
-        pv_annual = prod_y[PV_COL].sum() / 4.0
-        wind_annual = wind_total.sum() / 4.0
-        total_renew = pv_annual + wind_annual
-
-        if total_renew > 0:
-            # Skaliere auf 1000 TWh * FAKTOR, mit Verhältnis alpha
-            target_prod = 1000.0 * FAKTOR
-            pv_scaled = target_prod * ALPHA
-            wind_scaled = target_prod * (1 - ALPHA)
-
-            # Normiere die Zeitreihen
-            prod_y["PV_norm_TWh"] = rescale_to_target(prod_y[PV_COL], pv_scaled)
-            prod_y["Wind_norm_TWh"] = rescale_to_target(wind_total, wind_scaled)
-            prod_y["Prod_total_norm_TWh"] = prod_y["PV_norm_TWh"] + prod_y["Wind_norm_TWh"]
-        else:
-            prod_y["PV_norm_TWh"] = 0
-            prod_y["Wind_norm_TWh"] = 0
-            prod_y["Prod_total_norm_TWh"] = 0
-
         # Normiere Verbrauch auf 1000 TWh
-        cons_y["Cons_norm_TWh"] = rescale_to_target(cons_y[CONSUMPTION_COL], 1000.0)
+        prod_series, cons_series, prod_y, cons_y = prepare_yearly_series(cons_y, prod_y, ALPHA, FAKTOR)
 
-        # Simuliere Speicher
-        prod_series = prod_y["Prod_total_norm_TWh"]
-        cons_series = cons_y["Cons_norm_TWh"]
+        storage_defs = [("Speicher_1", SPEICHER_KAPAZITAET_TWH, EINSPEISE_EFFIZIENZ, AUSSPEISE_EFFIZIENZ)]
+        manager = build_storage_manager(storage_defs)
+        manager, _ = run_storage_simulation(prod_series, cons_series, manager)
 
-        # Sortiere nach Zeit
-        prod_y = prod_y.sort_values("Datum von")
-        cons_y = cons_y.sort_values("Datum von")
-        prod_series = prod_y["Prod_total_norm_TWh"]
-        cons_series = cons_y["Cons_norm_TWh"]
+        for storage in manager.storages:
+            end_levels_by_storage.setdefault(storage.name, []).append(storage.get_level())
+            capacities_by_storage[storage.name] = storage.capacity_twh
 
-        storage_levels, deltas, total_stored, total_loss = simulate_storage(
-            prod_series, cons_series, SPEICHER_KAPAZITAET_TWH, EINSPEISE_EFFIZIENZ, AUSSPEISE_EFFIZIENZ
-        )
+        yearly_data.append((year, prod_series, cons_series, prod_y, cons_y))
 
-        # Ergebnisse speichern
-        results_df = pd.DataFrame({
-            DATE_COL: prod_y[DATE_COL],
-            "Prod_norm_TWh": prod_y["Prod_total_norm_TWh"],
-            "Cons_norm_TWh": cons_y["Cons_norm_TWh"],
-            "Delta_TWh": deltas,
-            "Storage_Level_TWh": storage_levels
-        })
+    initial_level_percents = {}
+    for name, levels in end_levels_by_storage.items():
+        capacity = capacities_by_storage.get(name)
+        initial_level_percents[name] = float(np.mean(levels)) / capacity if capacity > 0 else 0.0
+        initial_level_percents[name] = max(0.0, min(initial_level_percents[name], 1.0))
+
+    print("Startfüllstände für den zweiten Durchgang:")
+    for name, percent in initial_level_percents.items():
+        print(f"  {name}: {percent * 100:.1f}%")
+
+    for year, prod_series, cons_series, prod_y, cons_y in yearly_data:
+        manager.reset(initial_level_percents)
+        manager, step_rows = run_storage_simulation(prod_series, cons_series, manager)
+
+        results_df = pd.DataFrame(step_rows)
+        results_df[DATE_COL] = prod_y[DATE_COL].reset_index(drop=True)
+        results_df["Prod_norm_TWh"] = prod_y["Prod_total_norm_TWh"].reset_index(drop=True)
+        results_df["Cons_norm_TWh"] = cons_y["Cons_norm_TWh"].reset_index(drop=True)
 
         output_file = OUTPUT_DIR / f"simulation_{year}_alpha_{ALPHA}_capacity_{SPEICHER_KAPAZITAET_TWH}.csv"
         results_df.to_csv(output_file, sep=";", decimal=",", index=False)
 
-        # Statistiken speichern
         stats_file = OUTPUT_DIR / f"stats_{year}_alpha_{ALPHA}_capacity_{SPEICHER_KAPAZITAET_TWH}.txt"
         with open(stats_file, 'w') as f:
             f.write(f"Jahr: {year}\n")
             f.write(f"Alpha: {ALPHA}\n")
             f.write(f"Capacity: {SPEICHER_KAPAZITAET_TWH} TWh\n")
-            f.write(f"Stored: {total_stored:.4f} TWh\n")
-            f.write(f"Loss: {total_loss:.4f} TWh\n")
+            f.write(f"Gesamt-Endfüllstand: {sum(storage.get_level() for storage in manager.storages):.4f} TWh\n")
+            f.write(f"Gesamt-Verlust: {sum(storage.total_loss for storage in manager.storages):.4f} TWh\n")
+            for storage in manager.storages:
+                f.write(f"\nSpeicher: {storage.name}\n")
+                f.write(f"  Startfüllstand: {initial_level_percents[storage.name] * storage.capacity_twh:.4f} TWh ({initial_level_percents[storage.name] * 100:.1f}%)\n")
+                f.write(f"  Endfüllstand: {storage.get_level():.4f} TWh ({storage.get_level_percent():.1f}%)\n")
+                f.write(f"  Total charge: {storage.total_charged:.4f} TWh\n")
+                f.write(f"  Total discharge: {storage.total_discharged:.4f} TWh\n")
+                f.write(f"  Total loss: {storage.total_loss:.4f} TWh\n")
 
-        print(f"Jahr {year}: Gespeichert {total_stored:.4f} TWh, Verlust {total_loss:.4f} TWh")
+        print(f"Jahr {year}: Gesamt-Endfüllstand {sum(storage.get_level() for storage in manager.storages):.4f} TWh, Gesamt-Verlust {sum(storage.total_loss for storage in manager.storages):.4f} TWh")
 
     print("\nSimulation abgeschlossen.")
 
