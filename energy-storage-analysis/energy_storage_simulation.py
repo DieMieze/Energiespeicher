@@ -2,7 +2,6 @@ import argparse
 import pandas as pd
 import numpy as np
 from pathlib import Path
-import sys
 
 from storage_manager import StorageManager
 
@@ -15,13 +14,6 @@ except NameError:
 RAW_DIR = BASE / "data" / "raw"
 OUTPUT_DIR = BASE / "data" / "simulated"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-# --- Benutzerdefinierte Variablen ---
-# FAKTOR = 1.0  # Faktor für Produktionsnormalisierung (1000 TWh * FAKTOR)
-# ALPHA = 0.5  # Verhältnis Sonne zu Wind (z.B. 0.5 bedeutet 50% Sonne, 50% Wind)
-# SPEICHER_KAPAZITAET_TWH = 10000.0  # Speicherkapazität in TWh
-# EINSPEISE_EFFIZIENZ = 1  # Effizienz beim Einspeisen (90%)
-# AUSSPEISE_EFFIZIENZ = 1  # Effizienz beim Ausspeisen (90%)
 
 # --- Spaltennamen ---
 DATE_COL = "Datum von"
@@ -222,7 +214,10 @@ def main():
         # Normiere Verbrauch auf 1000 TWh
         prod_series, cons_series, prod_y, cons_y = prepare_yearly_series(cons_y, prod_y, ALPHA, FAKTOR)
 
-        storage_defs = [("Speicher_1", SPEICHER_KAPAZITAET_TWH, EINSPEISE_EFFIZIENZ, AUSSPEISE_EFFIZIENZ)]
+        storage_defs = [("Pumpspeicher", SPEICHER_KAPAZITAET_TWH, EINSPEISE_EFFIZIENZ, AUSSPEISE_EFFIZIENZ),
+                        ("Chemischer Speicher", 0.020, 0.95, 0.95),
+                        ("Wasserstoff", 1000, 0.67, 0.3)
+                        ]
         manager = build_storage_manager(storage_defs)
         manager, _ = run_storage_simulation(prod_series, cons_series, manager)
 
@@ -255,12 +250,17 @@ def main():
         results_df.to_csv(output_file, sep=";", decimal=",", index=False)
 
         stats_file = OUTPUT_DIR / f"stats_{year}_alpha_{ALPHA}_capacity_{SPEICHER_KAPAZITAET_TWH}.txt"
+        total_unmet_demand = sum(abs(x) for x in manager.final_reduced_mismatch if x < 0)
+        total_unstorable_surplus = sum(x for x in manager.final_reduced_mismatch if x > 0)
+        
         with open(stats_file, 'w') as f:
             f.write(f"Jahr: {year}\n")
             f.write(f"Alpha: {ALPHA}\n")
             f.write(f"Capacity: {SPEICHER_KAPAZITAET_TWH} TWh\n")
             f.write(f"Gesamt-Endfüllstand: {sum(storage.get_level() for storage in manager.storages):.4f} TWh\n")
             f.write(f"Gesamt-Verlust: {sum(storage.total_loss for storage in manager.storages):.4f} TWh\n")
+            f.write(f"Nicht gespeicherbarer Überschuss: {total_unstorable_surplus:.4f} TWh\n")
+            f.write(f"Ungedeckte Nachfrage: {total_unmet_demand:.4f} TWh\n")
             for storage in manager.storages:
                 f.write(f"\nSpeicher: {storage.name}\n")
                 f.write(f"  Startfüllstand: {initial_level_percents[storage.name] * storage.capacity_twh:.4f} TWh ({initial_level_percents[storage.name] * 100:.1f}%)\n")
